@@ -266,6 +266,35 @@ class OpenAIGenerator:
         return answer
 
 
+class GeminiGenerator:
+    def __init__(self, max_output_tokens: int = 300) -> None:
+        api_key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("OPENAI_API_KEY", "").strip()
+        self.model = os.getenv("GEMINI_MODEL", "").strip() or os.getenv("OPENAI_MODEL", "").strip()
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY or OPENAI_API_KEY is missing from .env")
+        if not self.model:
+            raise RuntimeError("GEMINI_MODEL or OPENAI_MODEL is missing from .env")
+        import google.generativeai as genai
+        genai.configure(api_key=api_key)
+        self._genai = genai
+        self._model_name = self.model
+        self.max_output_tokens = max_output_tokens
+
+    def generate(self, prompt: str) -> str:
+        model = self._genai.GenerativeModel(self._model_name)
+        response = model.generate_content(
+            prompt,
+            generation_config={
+                "temperature": 0,
+                "max_output_tokens": self.max_output_tokens,
+            },
+        )
+        text = (getattr(response, "text", None) or "").strip()
+        if not text:
+            raise RuntimeError("Gemini returned an empty answer")
+        return text
+
+
 @dataclass(frozen=True)
 class DomainResponse:
     question: str
@@ -296,10 +325,16 @@ class DomainAssistant:
         top_k: int = 5,
     ) -> DomainAssistant:
         corpus_id, chunks = load_corpus(corpus_dir)
+        if generator is None:
+            model_name = os.getenv("OPENAI_MODEL", "").strip()
+            if model_name.startswith("gemini-"):
+                generator = GeminiGenerator()
+            else:
+                generator = OpenAIGenerator()
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator,
             top_k,
         )
 
@@ -420,12 +455,7 @@ def generate_actual_answers(
         )
 
         started_at = time.perf_counter()
-        try:
-            response = assistant.answer_with_trace(item["question"])
-        except Exception:
-            notify(f"FAILED at {item['id']}; stopping the run.")
-            raise
-
+        response = _generate_with_retry(assistant, item["question"], notify)
         answers.append(
             {
                 "id": item["id"],
@@ -452,6 +482,9 @@ def generate_actual_answers(
             f"({elapsed:.1f}s, {len(response.retrieved_chunks)} chunks)"
         )
 
+        if index < total:
+            time.sleep(5)
+
     return {
         "schema_version": "1.0",
         "corpus_id": assistant.corpus_id,
@@ -464,6 +497,34 @@ def generate_actual_answers(
         },
         "answers": answers,
     }
+
+
+def _generate_with_retry(
+    assistant: DomainAssistant,
+    question: str,
+    notify: ProgressCallback,
+    max_retries: int = 3,
+    base_delay: float = 30.0,
+) -> DomainResponse:
+    for attempt in range(max_retries):
+        try:
+            return assistant.answer_with_trace(question)
+        except Exception as exc:
+            message = str(exc)
+            is_rate_limit = (
+                "RESOURCE_EXHAUSTED" in message
+                or "quota" in message.lower()
+                or "429" in message
+            )
+            if not is_rate_limit or attempt == max_retries - 1:
+                notify(f"FAILED at attempt {attempt + 1}; stopping the run.")
+                raise
+            delay = base_delay * (2 ** attempt)
+            notify(
+                f"Rate limited on attempt {attempt + 1}; retrying in {delay:.0f}s..."
+            )
+            time.sleep(delay)
+    raise RuntimeError("Unreachable retry path")
 
 
 def parse_args() -> argparse.Namespace:
